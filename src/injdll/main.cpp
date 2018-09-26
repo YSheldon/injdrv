@@ -230,6 +230,7 @@ OnProcessAttach(
   //
   // Hide this DLL from the PEB.
   //
+
   PPEB Peb = NtCurrentPeb();
   PLIST_ENTRY ListEntry;
 
