@@ -42,6 +42,7 @@
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
   </ImportGroup>
   <PropertyGroup>
+    <TargetName>$(ProjectName)$(PlatformShortName)</TargetName>
     <OutDir>$(SolutionDir)bin\$(PlatformShortName)\$(Configuration)\</OutDir>
     <IntDir>$(SolutionDir)bin\obj\$(PlatformShortName)\$(Configuration)\$(ProjectName)\</IntDir>
   </PropertyGroup>
@@ -51,7 +52,8 @@
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpplatest</LanguageStandard>
       <ObjectFileName>$(IntDir)%(RelativeDir)%(Filename)%(Extension).obj</ObjectFileName>
-      <AdditionalIncludeDirectories>$(SolutionDir)src\DetoursNT\Detours\src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(SolutionDir)include;$(SolutionDir)src\DetoursNT\Detours\src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
       <SupportJustMyCode>false</SupportJustMyCode>
       <ExceptionHandling>false</ExceptionHandling>
@@ -61,7 +63,7 @@
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>$(SolutionDir)bin\$(PlatformShortName)\$(Configuration)\ntdll_$(PlatformShortName).lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>ntdll.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <IgnoreAllDefaultLibraries>true</IgnoreAllDefaultLibraries>
       <EntryPointSymbol>NtDllMain</EntryPointSymbol>
     </Link>
@@ -79,9 +81,6 @@
       <Optimization>Disabled</Optimization>
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
     </ClCompile>
-    <PreLinkEvent>
-      <Command>lib /nologo /def:"$(SolutionDir)\src\injdll\ntdll_$(PlatformShortName).def" /out:"$(SolutionDir)bin\$(PlatformShortName)\$(Configuration)\ntdll_$(PlatformShortName).lib" /machine:$(PlatformShortName)</Command>
-    </PreLinkEvent>
   </ItemDefinitionGroup>
   <!-- Release -->
   <PropertyGroup Condition="'$(Configuration)'=='Release'" Label="Configuration">
@@ -98,7 +97,6 @@
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
       <FunctionLevelLinking>true</FunctionLevelLinking>
-      <IntrinsicFunctions>true</IntrinsicFunctions>
     </ClCompile>
     <Link>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
@@ -120,7 +118,36 @@
     </ProjectReference>
   </ItemGroup>
   <ItemGroup>
-    <CustomBuild Include="ntdll_x86.def" />
-    <CustomBuild Include="ntdll_x64.def" />
+    <ClInclude Include="..\..\include\ntdbg.h" />
+    <ClInclude Include="..\..\include\ntdll.h" />
+    <ClInclude Include="..\..\include\ntdll_ntdef.h" />
+    <ClInclude Include="..\..\include\ntdll_windows.h" />
+    <ClInclude Include="..\..\include\ntexapi.h" />
+    <ClInclude Include="..\..\include\ntgdi.h" />
+    <ClInclude Include="..\..\include\ntioapi.h" />
+    <ClInclude Include="..\..\include\ntkeapi.h" />
+    <ClInclude Include="..\..\include\ntldr.h" />
+    <ClInclude Include="..\..\include\ntlpcapi.h" />
+    <ClInclude Include="..\..\include\ntmisc.h" />
+    <ClInclude Include="..\..\include\ntmmapi.h" />
+    <ClInclude Include="..\..\include\ntnls.h" />
+    <ClInclude Include="..\..\include\ntobapi.h" />
+    <ClInclude Include="..\..\include\ntpebteb.h" />
+    <ClInclude Include="..\..\include\ntpfapi.h" />
+    <ClInclude Include="..\..\include\ntpnpapi.h" />
+    <ClInclude Include="..\..\include\ntpoapi.h" />
+    <ClInclude Include="..\..\include\ntpsapi.h" />
+    <ClInclude Include="..\..\include\ntregapi.h" />
+    <ClInclude Include="..\..\include\ntrtl.h" />
+    <ClInclude Include="..\..\include\ntsam.h" />
+    <ClInclude Include="..\..\include\ntseapi.h" />
+    <ClInclude Include="..\..\include\ntsmss.h" />
+    <ClInclude Include="..\..\include\nttmapi.h" />
+    <ClInclude Include="..\..\include\nttp.h" />
+    <ClInclude Include="..\..\include\ntwow64.h" />
+    <ClInclude Include="..\..\include\ntxcapi.h" />
+    <ClInclude Include="..\..\include\ntzwapi.h" />
+    <ClInclude Include="..\..\include\subprocesstag.h" />
+    <ClInclude Include="..\..\include\winsta.h" />
   </ItemGroup>
 </Project>

@@ -1,3 +1,5 @@
+#include "injdrv.h"
+
 #include <ntddk.h>
 #include <ntimage.h>
 
@@ -87,6 +89,20 @@ PsGetProcessWow64Process(
   _In_ PEPROCESS Process
   );
 
+NTKERNELAPI
+PCHAR
+NTAPI
+PsGetProcessImageFileName (
+  _In_ PEPROCESS Process
+  );
+
+NTKERNELAPI
+BOOLEAN
+NTAPI
+PsIsProtectedProcess(
+  _In_ PEPROCESS Process
+  );
+
 //////////////////////////////////////////////////////////////////////////
 // ntrtl.h
 //////////////////////////////////////////////////////////////////////////
@@ -131,68 +147,16 @@ typedef struct _INJ_SYSTEM_DLL_DESCRIPTOR
   INJ_SYSTEM_DLL Flag;
 } INJ_SYSTEM_DLL_DESCRIPTOR, *PINJ_SYSTEM_DLL_DESCRIPTOR;
 
-typedef struct _INJ_HOOK_INFO
-{
-  LIST_ENTRY  ListEntry;
-
-  //
-  // Process ID of the hooked process.
-  //
-  HANDLE      ProcessId;
-
-  //
-  // Combination of INJ_SYSTEM_DLL flags indicating
-  // which DLLs has been already loaded into this
-  // process.
-  //
-  ULONG       LoadedDlls;
-
-  //
-  // If true, the hook has been already installed.
-  //
-  BOOLEAN     HookInstalled;
-
-  //
-  // If true, trigger of the queued user APC will be
-  // immediately forced upon next kernel->user transition.
-  //
-  BOOLEAN     ForceUserApc;
-
-  //
-  // Address of LdrLoadDll routine within 32-bit ntdll.dll.
-  //
-  PVOID       LdrLoadDllIx86;
-
-#if defined(_M_AMD64)
-  //
-  // Address of LdrLoadDll routine within 64-bit ntdll.dll.
-  //
-  PVOID       LdrLoadDllAmd64;
-
-  //
-  // Address of Wow64ApcRoutine within wow64.dll.
-  //
-  PVOID       Wow64ApcRoutine;
-
-  //
-  // If true, 32-bit DLL will be injected into Wow64
-  // processes.  If false, 64-bit DLL will be injected
-  // into Wow64 processes.
-  //
-  BOOLEAN     UseWow64Injection;
-#endif
-} INJ_HOOK_INFO, *PINJ_HOOK_INFO;
-
 typedef struct _INJ_GLOBAL_DATA
 {
   LIST_ENTRY      HookInfoListHead;
 
-  UNICODE_STRING  HookDllPathIx86;
-  PWCHAR          HookDllPathBufferIx86;
+  UNICODE_STRING  HookDllPathX86;
+  PWCHAR          HookDllPathBufferX86;
 
 #if defined(_M_AMD64)
-  UNICODE_STRING  HookDllPathAmd64;
-  PWCHAR          HookDllPathBufferAmd64;
+  UNICODE_STRING  HookDllPathX64;
+  PWCHAR          HookDllPathBufferX64;
 
   BOOLEAN         UseWow64Injection;
 #endif
@@ -204,53 +168,17 @@ typedef struct _INJ_GLOBAL_DATA
 
 NTSTATUS
 NTAPI
-InjInitialize(
-  _In_ PUNICODE_STRING HookDllPathIx86,
-  _In_ PUNICODE_STRING HookDllPathAmd64,
-  _In_ BOOLEAN UseWow64Injection
-  );
-
-VOID
-NTAPI
-InjDestroy(
-  VOID
-  );
-
-NTSTATUS
-NTAPI
-InjCreateHookInfo(
-  _In_ HANDLE ProcessId
-  );
-
-VOID
-NTAPI
-InjRemoveHookInfo(
-  _In_ HANDLE ProcessId
-  );
-
-PINJ_HOOK_INFO
-NTAPI
-InjFindHookInfo(
-  _In_ HANDLE ProcessId
-  );
-
-BOOLEAN
-NTAPI
-InjCanInject(
-  _In_ PINJ_HOOK_INFO HookInfo
-  );
-
-NTSTATUS
-NTAPI
-InjInject(
-  _In_ PINJ_HOOK_INFO HookInfo
-  );
-
-NTSTATUS
-NTAPI
 InjpQueueApc(
   _In_ KPROCESSOR_MODE ApcMode,
   _In_ PKNORMAL_ROUTINE NormalRoutine,
+  _In_ PVOID NormalContext,
+  _In_ PVOID SystemArgument1,
+  _In_ PVOID SystemArgument2
+  );
+
+VOID
+NTAPI
+InjpInjectApcNormalRoutine(
   _In_ PVOID NormalContext,
   _In_ PVOID SystemArgument1,
   _In_ PVOID SystemArgument2
@@ -301,6 +229,7 @@ RtlxFindExportedRoutineByName(
 {
   //
   // Borrowed from ReactOS.
+  // Note that this function is not exported by ntoskrnl until Win10.
   //
 
   PULONG NameTable;
@@ -421,6 +350,184 @@ RtlxFindExportedRoutineByName(
 // Private functions.
 //////////////////////////////////////////////////////////////////////////
 
+//
+// Taken from ReactOS, used by InjpInitializeHookDllPaths.
+//
+
+typedef union
+{
+  WCHAR Name[sizeof(ULARGE_INTEGER) / sizeof(WCHAR)];
+  ULARGE_INTEGER Alignment;
+} ALIGNEDNAME;
+
+//
+// DOS Device Prefix \??\
+//
+
+ALIGNEDNAME ObpDosDevicesShortNamePrefix = { { L'\\', L'?', L'?', L'\\' } };
+UNICODE_STRING ObpDosDevicesShortName = {
+  sizeof(ObpDosDevicesShortNamePrefix), // Length
+  sizeof(ObpDosDevicesShortNamePrefix), // MaximumLength
+  (PWSTR)&ObpDosDevicesShortNamePrefix  // Buffer
+};
+
+NTSTATUS
+NTAPI
+InjpInitializeHookDllPaths(
+  _In_ PUNICODE_STRING RegistryPath,
+  _Inout_ PUNICODE_STRING HookDllPathX86,
+  _Inout_ PUNICODE_STRING HookDllPathX64
+  )
+{
+#if _M_IX86
+  UNREFERENCED_PARAMETER(HookDllPathX64);
+#endif
+
+  //
+  // In the "ImagePath" key of the RegistryPath, there
+  // is a full path of this driver file.  Fetch it.
+  //
+
+  NTSTATUS Status;
+
+  UNICODE_STRING ValueName = RTL_CONSTANT_STRING(L"ImagePath");
+
+  OBJECT_ATTRIBUTES ObjectAttributes;
+  InitializeObjectAttributes(&ObjectAttributes,
+                             RegistryPath,
+                             OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
+                             NULL,
+                             NULL);
+
+  HANDLE KeyHandle;
+  Status = ZwOpenKey(&KeyHandle,
+                     KEY_READ,
+                     &ObjectAttributes);
+
+  if (!NT_SUCCESS(Status))
+  {
+    return Status;
+  }
+
+  //
+  // Save all information on stack - simply fail if path
+  // is too long.
+  //
+
+  UCHAR KeyValueInformationBuffer[sizeof(KEY_VALUE_FULL_INFORMATION) + sizeof(WCHAR) * 128];
+  PKEY_VALUE_FULL_INFORMATION KeyValueInformation = (PKEY_VALUE_FULL_INFORMATION)KeyValueInformationBuffer;
+
+  ULONG ResultLength;
+  Status = ZwQueryValueKey(KeyHandle,
+                           &ValueName,
+                           KeyValueFullInformation,
+                           KeyValueInformation,
+                           sizeof(KeyValueInformationBuffer),
+                           &ResultLength);
+
+  ZwClose(KeyHandle);
+
+  //
+  // Check for succes.  Also check if the value is of expected type
+  // and whether the path has a meaninful length.
+  //
+
+  if (!NT_SUCCESS(Status) ||
+      KeyValueInformation->Type != REG_EXPAND_SZ ||
+      KeyValueInformation->DataLength < sizeof(ObpDosDevicesShortNamePrefix))
+  {
+    return Status;
+  }
+
+  //
+  // Save pointer to the fetched ImagePath value and test
+  // if the path starts with "\??\" prefix - if so, skip it.
+  //
+
+  PWCHAR ImagePathValue = (PWCHAR)((PUCHAR)KeyValueInformation + KeyValueInformation->DataOffset);
+  ULONG  ImagePathValueLength = KeyValueInformation->DataLength;
+
+  if (*(PULONGLONG)(ImagePathValue) == ObpDosDevicesShortNamePrefix.Alignment.QuadPart)
+  {
+    ImagePathValue += ObpDosDevicesShortName.Length / sizeof(WCHAR);
+    ImagePathValueLength -= ObpDosDevicesShortName.Length;
+  }
+
+  //
+  // Find last occurence of the "\" character and if found,
+  // save its position.
+  //
+
+  PWCHAR LastBackslash = wcsrchr(ImagePathValue, L'\\');
+
+  if (!LastBackslash)
+  {
+    return STATUS_DATA_ERROR;
+  }
+
+  ULONG LastBackslashCharacterPosition = (ULONG)(LastBackslash - ImagePathValue);
+  ULONG LastBackslashBytePosition = LastBackslashCharacterPosition * sizeof(WCHAR);
+
+  //
+  // Finally, fill the buffer...
+  // Buffer is filled with the ImagePath up to the last
+  // "\" cahracter (including), then the DLL name is appended.
+  //
+
+#define INJ_DLL_X86_NAME  L"injdllx86.dll"
+
+  RtlCopyMemory(HookDllPathX86->Buffer,
+                ImagePathValue,
+                LastBackslashBytePosition + sizeof(WCHAR));
+
+  if (HookDllPathX86->MaximumLength - LastBackslashCharacterPosition
+      < sizeof(INJ_DLL_X86_NAME))
+  {
+    return STATUS_DATA_ERROR;
+  }
+
+  wcscpy(HookDllPathX86->Buffer + LastBackslashCharacterPosition + 1,
+         INJ_DLL_X86_NAME);
+
+  HookDllPathX86->Length = (USHORT)(LastBackslashBytePosition + sizeof(INJ_DLL_X86_NAME));
+
+  DbgPrintEx(DPFLTR_IHVDRIVER_ID,
+             DPFLTR_ERROR_LEVEL,
+             "DLL x86 path: '%wZ'\n",
+             HookDllPathX86);
+
+#if _M_AMD64
+  if (!HookDllPathX64)
+  {
+    return STATUS_PARTIAL_COPY;
+  }
+
+#define INJ_DLL_X64_NAME  L"injdllx64.dll"
+
+  RtlCopyMemory(HookDllPathX64->Buffer,
+                ImagePathValue,
+                LastBackslashBytePosition + sizeof(WCHAR));
+
+  if (HookDllPathX64->MaximumLength - LastBackslashCharacterPosition
+      < sizeof(INJ_DLL_X64_NAME))
+  {
+    return STATUS_DATA_ERROR;
+  }
+
+  wcscpy(HookDllPathX64->Buffer + LastBackslashCharacterPosition + 1,
+         INJ_DLL_X64_NAME);
+
+  HookDllPathX64->Length = (USHORT)(LastBackslashBytePosition + sizeof(INJ_DLL_X64_NAME));
+
+  DbgPrintEx(DPFLTR_IHVDRIVER_ID,
+             DPFLTR_ERROR_LEVEL,
+             "DLL x64 path: '%wZ'\n",
+             HookDllPathX64);
+#endif
+
+  return STATUS_SUCCESS;
+}
+
 NTSTATUS
 NTAPI
 InjpQueueApc(
@@ -473,6 +580,21 @@ InjpQueueApc(
 
 VOID
 NTAPI
+InjpInjectApcNormalRoutine(
+  _In_ PVOID NormalContext,
+  _In_ PVOID SystemArgument1,
+  _In_ PVOID SystemArgument2
+  )
+{
+  UNREFERENCED_PARAMETER(SystemArgument1);
+  UNREFERENCED_PARAMETER(SystemArgument2);
+
+  PINJ_HOOK_INFO HookInfo = NormalContext;
+  InjInject(HookInfo);
+}
+
+VOID
+NTAPI
 InjpInjectApcKernelRoutine(
   _In_ PKAPC Apc,
   _Inout_ PKNORMAL_ROUTINE* NormalRoutine,
@@ -498,7 +620,7 @@ InjpInjectApcKernelRoutine(
 
 NTSTATUS
 NTAPI
-InjpInjectIx86(
+InjpInjectX86(
   _In_ PINJ_HOOK_INFO HookInfo,
   _In_ HANDLE SectionHandle,
   _In_ SIZE_T SectionSize
@@ -506,7 +628,7 @@ InjpInjectIx86(
 {
   NTSTATUS Status;
 
-  NT_ASSERT(HookInfo->LdrLoadDllIx86);
+  NT_ASSERT(HookInfo->LdrLoadDllX86);
 #if defined(_M_AMD64)
   NT_ASSERT(HookInfo->Wow64ApcRoutine);
 #endif
@@ -657,11 +779,11 @@ InjpInjectIx86(
   // Fill the data of the ApcContext.
   //
 
-  ApcContext->LdrLoadDll = (ULONG)(ULONG_PTR)HookInfo->LdrLoadDllIx86;
-  ApcContext->DllNameLength = GlobalData.HookDllPathIx86.Length;
+  ApcContext->LdrLoadDll = (ULONG)(ULONG_PTR)HookInfo->LdrLoadDllX86;
+  ApcContext->DllNameLength = GlobalData.HookDllPathX86.Length;
   RtlCopyMemory(ApcContext->DllNameBuffer,
-                GlobalData.HookDllPathIx86.Buffer,
-                GlobalData.HookDllPathIx86.Length);
+                GlobalData.HookDllPathX86.Buffer,
+                GlobalData.HookDllPathX86.Length);
 
   //
   // Unmap the section and map it again, but now
@@ -720,13 +842,13 @@ Exit:
 #if defined (_M_AMD64)
 NTSTATUS
 NTAPI
-InjpInjectAmd64(
+InjpInjectX64(
   _In_ PINJ_HOOK_INFO HookInfo,
   _In_ HANDLE SectionHandle,
   _In_ SIZE_T SectionSize
   )
 {
-  NT_ASSERT(HookInfo->LdrLoadDllAmd64);
+  NT_ASSERT(HookInfo->LdrLoadDllX64);
 
   NTSTATUS Status;
 
@@ -756,13 +878,13 @@ InjpInjectAmd64(
   PWCHAR DllNameBuffer = (PWCHAR)((PUCHAR)DllName + sizeof(UNICODE_STRING));
 
   RtlCopyMemory(DllNameBuffer,
-                GlobalData.HookDllPathAmd64.Buffer,
-                GlobalData.HookDllPathAmd64.MaximumLength);
+                GlobalData.HookDllPathX64.Buffer,
+                GlobalData.HookDllPathX64.MaximumLength);
 
   RtlInitUnicodeString(DllName, DllNameBuffer);
 
   Status = InjpQueueApc(UserMode,
-                        (PKNORMAL_ROUTINE)(ULONG_PTR)HookInfo->LdrLoadDllAmd64,
+                        (PKNORMAL_ROUTINE)(ULONG_PTR)HookInfo->LdrLoadDllX64,
                         NULL,     // Translates to 1st param. of LdrLoadDll (SearchPath)
                         NULL,     // Translates to 2nd param. of LdrLoadDll (DllCharacteristics)
                         DllName); // Translates to 3rd param. of LdrLoadDll (DllName)
@@ -796,21 +918,6 @@ Exit:
 }
 #endif
 
-VOID
-NTAPI
-InjpInjectApcNormalRoutine(
-  _In_ PVOID NormalContext,
-  _In_ PVOID SystemArgument1,
-  _In_ PVOID SystemArgument2
-  )
-{
-  UNREFERENCED_PARAMETER(SystemArgument1);
-  UNREFERENCED_PARAMETER(SystemArgument2);
-
-  PINJ_HOOK_INFO HookInfo = NormalContext;
-  InjInject(HookInfo);
-}
-
 //////////////////////////////////////////////////////////////////////////
 // Public functions.
 //////////////////////////////////////////////////////////////////////////
@@ -818,13 +925,13 @@ InjpInjectApcNormalRoutine(
 NTSTATUS
 NTAPI
 InjInitialize(
-  _In_ PUNICODE_STRING HookDllPathIx86,
-  _In_ PUNICODE_STRING HookDllPathAmd64,
+  _In_ PUNICODE_STRING HookDllPathX86,
+  _In_ PUNICODE_STRING HookDllPathX64,
   _In_ BOOLEAN UseWow64Injection
   )
 {
 #if defined(_M_IX86)
-  UNREFERENCED_PARAMETER(HookDllPathAmd64);
+  UNREFERENCED_PARAMETER(HookDllPathX64);
   UNREFERENCED_PARAMETER(UseWow64Injection);
 #endif
 
@@ -835,48 +942,48 @@ InjInitialize(
   InitializeListHead(&GlobalData.HookInfoListHead);
 
   //
-  // Intel x86-specific initialization.
+  // x86-specific initialization.
   //
 
-  GlobalData.HookDllPathBufferIx86 = ExAllocatePoolWithTag(NonPagedPoolNx,
-                                                            HookDllPathIx86->MaximumLength,
-                                                            INJ_MEMORY_TAG);
+  GlobalData.HookDllPathBufferX86 = ExAllocatePoolWithTag(NonPagedPoolNx,
+                                                          HookDllPathX86->MaximumLength,
+                                                          INJ_MEMORY_TAG);
 
-  if (!GlobalData.HookDllPathBufferIx86)
+  if (!GlobalData.HookDllPathBufferX86)
   {
     return STATUS_INSUFFICIENT_RESOURCES;
   }
 
-  GlobalData.HookDllPathIx86.Length = HookDllPathIx86->Length;
-  GlobalData.HookDllPathIx86.MaximumLength = HookDllPathIx86->MaximumLength;
-  GlobalData.HookDllPathIx86.Buffer = GlobalData.HookDllPathBufferIx86;
+  GlobalData.HookDllPathX86.Length = HookDllPathX86->Length;
+  GlobalData.HookDllPathX86.MaximumLength = HookDllPathX86->MaximumLength;
+  GlobalData.HookDllPathX86.Buffer = GlobalData.HookDllPathBufferX86;
 
-  RtlCopyMemory(GlobalData.HookDllPathBufferIx86,
-                HookDllPathIx86->Buffer,
-                HookDllPathIx86->MaximumLength);
+  RtlCopyMemory(GlobalData.HookDllPathBufferX86,
+                HookDllPathX86->Buffer,
+                HookDllPathX86->MaximumLength);
 
 #if defined(_M_AMD64)
   //
-  // AMD64-specific initialization.
+  // x64-specific initialization.
   //
 
-  GlobalData.HookDllPathBufferAmd64 = ExAllocatePoolWithTag(NonPagedPoolNx,
-                                                            HookDllPathAmd64->MaximumLength,
-                                                            INJ_MEMORY_TAG);
+  GlobalData.HookDllPathBufferX64 = ExAllocatePoolWithTag(NonPagedPoolNx,
+                                                          HookDllPathX64->MaximumLength,
+                                                          INJ_MEMORY_TAG);
 
-  if (!GlobalData.HookDllPathBufferAmd64)
+  if (!GlobalData.HookDllPathBufferX64)
   {
-    ExFreePoolWithTag(GlobalData.HookDllPathBufferAmd64, INJ_MEMORY_TAG);
+    ExFreePoolWithTag(GlobalData.HookDllPathBufferX64, INJ_MEMORY_TAG);
     return STATUS_INSUFFICIENT_RESOURCES;
   }
 
-  GlobalData.HookDllPathAmd64.Length = HookDllPathAmd64->Length;
-  GlobalData.HookDllPathAmd64.MaximumLength = HookDllPathAmd64->MaximumLength;
-  GlobalData.HookDllPathAmd64.Buffer = GlobalData.HookDllPathBufferAmd64;
+  GlobalData.HookDllPathX64.Length = HookDllPathX64->Length;
+  GlobalData.HookDllPathX64.MaximumLength = HookDllPathX64->MaximumLength;
+  GlobalData.HookDllPathX64.Buffer = GlobalData.HookDllPathBufferX64;
 
-  RtlCopyMemory(GlobalData.HookDllPathBufferAmd64,
-                HookDllPathAmd64->Buffer,
-                HookDllPathAmd64->MaximumLength);
+  RtlCopyMemory(GlobalData.HookDllPathBufferX64,
+                HookDllPathX64->Buffer,
+                HookDllPathX64->MaximumLength);
 
   //
   // Default setting of the injection of Wow64 processes.
@@ -904,10 +1011,10 @@ InjDestroy(
     ExFreePoolWithTag(HookInfo, INJ_MEMORY_TAG);
   }
 
-  ExFreePoolWithTag(GlobalData.HookDllPathBufferIx86, INJ_MEMORY_TAG);
+  ExFreePoolWithTag(GlobalData.HookDllPathBufferX86, INJ_MEMORY_TAG);
 
 #if defined(_M_AMD64)
-  ExFreePoolWithTag(GlobalData.HookDllPathBufferAmd64, INJ_MEMORY_TAG);
+  ExFreePoolWithTag(GlobalData.HookDllPathBufferX64, INJ_MEMORY_TAG);
 #endif
 }
 
@@ -1031,7 +1138,7 @@ InjInject(
   // Note that this memory is created using sections
   // instead of ZwAllocateVirtualMemory, mainly because
   // function ZwProtectVirtualMemory is not exported
-  // by ntoskrnl.exe on 32-bit Windows.  In case of
+  // by ntoskrnl.exe until Windows 8.1.  In case of
   // sections, the effect of memory protection change
   // is achieved by remaping the section with different
   // protection type.
@@ -1062,22 +1169,22 @@ InjInject(
   }
 
 #if defined(_M_IX86)
-  Status = InjpInjectIx86(HookInfo,
-                          SectionHandle,
-                          SectionSize);
+  Status = InjpInjectX86(HookInfo,
+                         SectionHandle,
+                         SectionSize);
 #elif defined(_M_AMD64)
   if (PsGetProcessWow64Process(PsGetCurrentProcess()) &&
       HookInfo->UseWow64Injection)
   {
-    Status = InjpInjectIx86(HookInfo,
-                            SectionHandle,
-                            SectionSize);
+    Status = InjpInjectX86(HookInfo,
+                           SectionHandle,
+                           SectionSize);
   }
   else
   {
-    Status = InjpInjectAmd64(HookInfo,
-                             SectionHandle,
-                             SectionSize);
+    Status = InjpInjectX64(HookInfo,
+                           SectionHandle,
+                           SectionSize);
   }
 #endif
 
@@ -1139,6 +1246,28 @@ InjLoadImageNotifyRoutine(
     return;
   }
 
+  if (PsIsProtectedProcess(PsGetCurrentProcess()))
+  {
+    //
+    // Protected processes throw code-integrity error when
+    // they are hooked.  Signing policy can be changed, but
+    // it requires hacking with lots of internal and Windows-
+    // version-specific structures.  Simly don't hook such
+    // processes.
+    //
+    // See Blackbone project (https://github.com/DarthTon/Blackbone)
+    // if you're interested how protection can be temporarily
+    // disabled on such processes.  (Look for BBSetProtection).
+    //
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID,
+               DPFLTR_ERROR_LEVEL,
+               "Removing protected process '%s' from watchlist...\n",
+               PsGetProcessImageFileName(PsGetCurrentProcess()));
+
+    InjRemoveHookInfo(ProcessId);
+  }
+
   if (!InjCanInject(HookInfo))
   {
     //
@@ -1169,8 +1298,8 @@ InjLoadImageNotifyRoutine(
           //
 
           case INJ_SYSTEM32_NTDLL_LOADED:
-            HookInfo->LdrLoadDllIx86 = RtlxFindExportedRoutineByName(ImageInfo->ImageBase,
-                                                                     &LdrLoadDllRoutineName);
+            HookInfo->LdrLoadDllX86 = RtlxFindExportedRoutineByName(ImageInfo->ImageBase,
+                                                                    &LdrLoadDllRoutineName);
             break;
 #elif defined(_M_AMD64)
           //
@@ -1182,13 +1311,13 @@ InjLoadImageNotifyRoutine(
           //
 
           case INJ_SYSTEM32_NTDLL_LOADED:
-            HookInfo->LdrLoadDllAmd64 = RtlxFindExportedRoutineByName(ImageInfo->ImageBase,
-                                                                      &LdrLoadDllRoutineName);
+            HookInfo->LdrLoadDllX64 = RtlxFindExportedRoutineByName(ImageInfo->ImageBase,
+                                                                    &LdrLoadDllRoutineName);
             break;
 
           case INJ_SYSWOW64_NTDLL_LOADED:
-            HookInfo->LdrLoadDllIx86 = RtlxFindExportedRoutineByName(ImageInfo->ImageBase,
-                                                                     &LdrLoadDllRoutineName);
+            HookInfo->LdrLoadDllX86 = RtlxFindExportedRoutineByName(ImageInfo->ImageBase,
+                                                                    &LdrLoadDllRoutineName);
             break;
 
           case INJ_SYSTEM32_WOW64_LOADED:
@@ -1213,10 +1342,10 @@ InjLoadImageNotifyRoutine(
     //
 
     InjpQueueApc(KernelMode,
-                 &InjpInjectApcNormalRoutine,
-                 HookInfo,
-                 NULL,
-                 NULL);
+                  &InjpInjectApcNormalRoutine,
+                  HookInfo,
+                  NULL,
+                  NULL);
 
     //
     // Mark that this process is hooked.
@@ -1250,19 +1379,40 @@ DriverEntry(
   _In_ PUNICODE_STRING RegistryPath
   )
 {
-  UNREFERENCED_PARAMETER(RegistryPath);
-
   NTSTATUS Status;
 
   DriverObject->DriverUnload = &DriverDestroy;
 
-#define INJ_CUSTOM_PATH L"C:\\Users\\John\\Desktop\\"
+  WCHAR HookDllPathX86Buffer[128];
+  UNICODE_STRING HookDllPathX86;
+  HookDllPathX86.Length = 0;
+  HookDllPathX86.MaximumLength = sizeof(HookDllPathX86Buffer);
+  HookDllPathX86.Buffer = HookDllPathX86Buffer;
 
-  UNICODE_STRING HookDllPathIx86  = RTL_CONSTANT_STRING(INJ_CUSTOM_PATH L"inj\\x86\\Debug\\injdll.dll");
-  UNICODE_STRING HookDllPathAmd64 = RTL_CONSTANT_STRING(INJ_CUSTOM_PATH L"inj\\x64\\Debug\\injdll.dll");
-  BOOLEAN UseWow64Injection = TRUE;
-  Status = InjInitialize(&HookDllPathIx86,
-                         &HookDllPathAmd64,
+  WCHAR HookDllPathX64Buffer[128];
+  UNICODE_STRING HookDllPathX64;
+  HookDllPathX64.Length = 0;
+  HookDllPathX64.MaximumLength = sizeof(HookDllPathX64Buffer);
+  HookDllPathX64.Buffer = HookDllPathX64Buffer;
+
+  Status = InjpInitializeHookDllPaths(RegistryPath,
+                                      &HookDllPathX86,
+                                      &HookDllPathX64);
+
+  if (!NT_SUCCESS(Status))
+  {
+    return Status;
+  }
+
+  //
+  // #define INJ_CUSTOM_PATH L"C:\\Users\\John\\Desktop\\"
+  //   UNICODE_STRING HookDllPathX86 = RTL_CONSTANT_STRING(INJ_CUSTOM_PATH L"keinject\\x86\\Debug\\injdll.dll");
+  //   UNICODE_STRING HookDllPathX64 = RTL_CONSTANT_STRING(INJ_CUSTOM_PATH L"keinject\\x64\\Debug\\injdll.dll");
+  //
+
+  BOOLEAN UseWow64Injection = FALSE;
+  Status = InjInitialize(&HookDllPathX86,
+                         &HookDllPathX64,
                          UseWow64Injection);
 
   if (!NT_SUCCESS(Status))
