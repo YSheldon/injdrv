@@ -204,7 +204,7 @@ DisableDetours(
 NTSTATUS
 NTAPI
 OnProcessAttach(
-  VOID
+  _In_ PVOID ModuleHandle
   )
 {
   //
@@ -220,6 +220,39 @@ OnProcessAttach(
   HANDLE NtdllHandle;
   LdrGetDllHandle(NULL, 0, &NtdllPath, &NtdllHandle);
   LdrGetProcedureAddress(NtdllHandle, &RoutineName, 0, (PVOID*)&_snwprintf);
+
+  //
+  // Make us unloadable (by FreeLibrary calls).
+  //
+
+  LdrAddRefDll(LDR_ADDREF_DLL_PIN, ModuleHandle);
+
+  //
+  // Hide this DLL from the PEB.
+  //
+  PPEB Peb = NtCurrentPeb();
+  PLIST_ENTRY ListEntry;
+
+  for (ListEntry =   Peb->Ldr->InLoadOrderModuleList.Flink;
+       ListEntry != &Peb->Ldr->InLoadOrderModuleList;
+       ListEntry =   ListEntry->Flink)
+  {
+    PLDR_DATA_TABLE_ENTRY LdrEntry = CONTAINING_RECORD(ListEntry, LDR_DATA_TABLE_ENTRY, InLoadOrderLinks);
+
+    //
+    // ModuleHandle is same as DLL base address.
+    //
+
+    if (LdrEntry->DllBase == ModuleHandle)
+    {
+      RemoveEntryList(&LdrEntry->InLoadOrderLinks);
+      RemoveEntryList(&LdrEntry->InInitializationOrderLinks);
+      RemoveEntryList(&LdrEntry->InMemoryOrderLinks);
+      RemoveEntryList(&LdrEntry->HashLinks);
+
+      break;
+    }
+  }
 
   //
   // Register ETW provider.
@@ -249,7 +282,6 @@ OnProcessAttach(
   // Get command line of the current process and send it.
   //
 
-  PPEB Peb = NtCurrentPeb();
   PWSTR CommandLine = Peb->ProcessParameters->CommandLine.Buffer;
 
   EtwEventWriteString(ProviderHandle,
@@ -267,7 +299,7 @@ OnProcessAttach(
 NTSTATUS
 NTAPI
 OnProcessDetach(
-  VOID
+  _In_ HANDLE ModuleHandle
   )
 {
   //
@@ -289,11 +321,11 @@ NtDllMain(
   switch (Reason)
   {
     case DLL_PROCESS_ATTACH:
-      OnProcessAttach();
+      OnProcessAttach(ModuleHandle);
       break;
 
     case DLL_PROCESS_DETACH:
-      OnProcessDetach();
+      OnProcessDetach(ModuleHandle);
       break;
 
     case DLL_THREAD_ATTACH:
